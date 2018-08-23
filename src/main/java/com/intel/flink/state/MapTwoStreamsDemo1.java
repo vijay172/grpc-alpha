@@ -6,8 +6,11 @@ import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.utils.ParameterTool;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.TaskManagerOptions;
+import org.apache.flink.dropwizard.metrics.DropwizardHistogramWrapper;
 import org.apache.flink.dropwizard.metrics.DropwizardMeterWrapper;
+import org.apache.flink.metrics.Histogram;
 import org.apache.flink.metrics.Meter;
+import org.apache.flink.runtime.metrics.DescriptiveStatisticsHistogram;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.AsyncDataStream;
 import org.apache.flink.streaming.api.datastream.DataStream;
@@ -18,6 +21,7 @@ import org.apache.flink.streaming.api.functions.async.RichAsyncFunction;
 import org.apache.flink.streaming.api.functions.co.RichCoFlatMapFunction;
 import org.apache.flink.util.Collector;
 
+import com.codahale.metrics.SlidingWindowReservoir;
 import com.intel.flink.datatypes.CameraTuple;
 import com.intel.flink.datatypes.CameraWithCube;
 import com.intel.flink.datatypes.InputMetadata;
@@ -59,7 +63,6 @@ public class MapTwoStreamsDemo1 {
     private static final String READ = "read";
 
     public static void main(String[] args) throws Exception {
-        //logger.info("args:", args);
         ParameterTool params = ParameterTool.fromArgs(args);
         final int parallelCamTasks = params.getInt("parallelCam", 38);
         final int parallelCubeTasks = params.getInt("parallelCube", 1000);
@@ -99,7 +102,7 @@ public class MapTwoStreamsDemo1 {
         } else {
             env = StreamExecutionEnvironment.getExecutionEnvironment();
         }
-        env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime);//EventTime not needed here as we are not dealing with EventTime timestamps
+        env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime); //EventTime not needed here as we are not dealing with EventTime timestamps
         //TODO: restart and checkpointing strategies
         /*env.setRestartStrategy(RestartStrategies.failureRateRestart(10, Time.minutes(1), Time.milliseconds(100)));
         env.enableCheckpointing(100);*/
@@ -120,7 +123,6 @@ public class MapTwoStreamsDemo1 {
                 .addSource(new CheckpointedCameraWithCubeSource(maxSeqCnt, servingSpeedMs, startTime, nbrCameras, outputFile, sourceDelay), "TileDB Camera")
                 .uid("TileDB-Camera")
                 .setParallelism(1);
-
 
         DataStream<CameraWithCube> cameraWithCubeDataStream;
         //for copy, only perform copyImage functionality
@@ -182,6 +184,7 @@ public class MapTwoStreamsDemo1 {
      * It is called sequentially for each record in the respective partition of the stream.
      * Unless the asyncInvoke(...) method returns fast and relies on a callback (by the client),
      * it will not result in proper asynchronous I/O.
+     *
      * <p>For the real use case in production environment, the thread pool may stay in the
      * async client.
      */
@@ -200,6 +203,9 @@ public class MapTwoStreamsDemo1 {
         private final String host;
         private final int port;
         private final long deadlineDuration;
+
+        private transient Histogram histogram;
+        private transient Histogram descrHistogram;
 
         SampleCopyAsyncFunction(final String host, final int port, final long shutdownWaitTS, final String inputFile,
                                 final String options, final int nThreads, final long deadlineDuration) {
@@ -224,6 +230,18 @@ public class MapTwoStreamsDemo1 {
                 }
                 ++counter;
             }
+            //TODO: does it need to be within synchronized block for transient variable ??
+            com.codahale.metrics.Histogram dropwizardHistogram =
+                    new com.codahale.metrics.Histogram(new SlidingWindowReservoir(500)); //TODO: what value should it be ?
+            this.histogram = getRuntimeContext()
+                    .getMetricGroup()
+                    .addGroup("CopyMetrics")
+                    .histogram("copyImageMetrics", new DropwizardHistogramWrapper(dropwizardHistogram));
+
+            this.descrHistogram = getRuntimeContext()
+                    .getMetricGroup()
+                    .addGroup("CopyMetricsDescr")
+                    .histogram("copyImageDescrMetrics", new DescriptiveStatisticsHistogram(500));
         }
 
         @Override
@@ -251,7 +269,7 @@ public class MapTwoStreamsDemo1 {
         }
 
         /**
-         * Trigger async operation for each Stream input of CameraWithCube
+         * Trigger async operation for each Stream input of CameraWithCube.
          *
          * @param cameraWithCube input - Emitter value
          * @param resultFuture   output async Collector of the result when query returns - Wrap Emitter in a Promise/Future
@@ -266,12 +284,12 @@ public class MapTwoStreamsDemo1 {
                     //add ts/cam.jpg
                     String outputFile1 = cameraWithCube.getFileLocation();
                     logger.debug("outputFile1: {}", outputFile1);
-                    long t = System.currentTimeMillis();
+                    long beforeCopyImageTS = System.currentTimeMillis();
                     //TODO: make it an async request through NativeLoader- currently synchronous JNI call - not reqd
                     final HashMap<String, Long> cameraWithCubeTimingMap = cameraWithCube.getTimingMap();
                     long generatedTS = cameraWithCubeTimingMap.get("Generated");
-                    cameraWithCubeTimingMap.put("BeforeCopyImage", t);
-                    long diff = t - generatedTS;
+                    cameraWithCubeTimingMap.put("BeforeCopyImage", beforeCopyImageTS);
+                    long diff = beforeCopyImageTS - generatedTS;
                     if (diff > 500) {
                         //print error msg in log & size of queue? & AfterCopyImage -1 & emit it
                         logger.error("CopyImage Diff for GeneratedTS:{} is:{} which is > 500 ms", generatedTS, diff);
@@ -279,7 +297,17 @@ public class MapTwoStreamsDemo1 {
                         cameraWithCubeTimingMap.put("AfterCopyImage", -1L);
                     } else {
                         String checkStrValue = nativeLoader.copyImage(deadlineDuration, inputFile, outputFile1, options);
-                        cameraWithCubeTimingMap.put("AfterCopyImage", System.currentTimeMillis());
+                        //ERROR:FILE_OPEN:Could not open file for reading
+                        //OK:1204835 bytes
+                        if (checkStrValue != null && checkStrValue.startsWith("ERROR")) {
+                            logger.error("Error copyImage:%s for CameraWithCube:%s", checkStrValue, cameraWithCube);
+                            cameraWithCube.getTimingMap().put("Error", -1L);
+                        }
+                        long afterCopyImageTS = System.currentTimeMillis();
+                        long timeTakenForCopyImage = afterCopyImageTS - beforeCopyImageTS;
+                        this.histogram.update(timeTakenForCopyImage);
+                        this.descrHistogram.update(timeTakenForCopyImage);
+                        cameraWithCubeTimingMap.put("AfterCopyImage", afterCopyImageTS);
                         logger.info("copyImage checkStrValue: {}", checkStrValue);
                         logger.debug("SampleCopyAsyncFunction - after JNI copyImage to copy S3 file to EFS with efsLocation:{}", outputFile1);
                     }
@@ -310,6 +338,7 @@ public class MapTwoStreamsDemo1 {
         private final String host;
         private final int port;
         private final long deadlineDuration;
+        private transient Histogram histogram;
 
         private static NativeLoader nativeLoaderRead;
 
@@ -339,6 +368,13 @@ public class MapTwoStreamsDemo1 {
                     CsvPreference.STANDARD_PREFERENCE);
             String[] header = {"ts", "cube", "cameraLst", "timingMap"};
             csvMapWriter.writeHeader(header);
+
+            com.codahale.metrics.Histogram dropwizardHistogram =
+                    new com.codahale.metrics.Histogram(new SlidingWindowReservoir(500)); //TODO: what value should it be ?
+            this.histogram = getRuntimeContext()
+                    .getMetricGroup()
+                    .addGroup("ReadMetrics")
+                    .histogram("readImageMetrics", new DropwizardHistogramWrapper(dropwizardHistogram));
 
             synchronized (SampleSinkAsyncFunction.class) {
                 if (counter1 == 0) {
@@ -383,12 +419,12 @@ public class MapTwoStreamsDemo1 {
         }
 
         /**
-         * Supply a tuple2 back after calling readImage using the provided ExecutirThread from the thread pool
+         * Supply a tuple2 back after calling readImage using the provided ExecutirThread from the thread pool.
          *
          * @param tuple2              Tuple2<InputMetadata, CameraWithCube>
          * @param cameraTuple         CameraTuple
          * @param executorServiceRead ExecutorService provided to use to get a thread from a Thread pool
-         * @return Tuple2<<   InputMetadata   ,       CameraWithCube>>
+         * @return inputMetadata Tuple2<<InputMetadata,CameraWithCube>>
          */
         private CompletableFuture<Tuple2<InputMetadata, CameraWithCube>> readImageAsync(final Tuple2<InputMetadata, CameraWithCube> tuple2, final CameraTuple cameraTuple, final ExecutorService executorServiceRead) {
             logger.debug("Entered SampleSinkAsyncFunction.readImageAsync()");
@@ -401,15 +437,26 @@ public class MapTwoStreamsDemo1 {
                     InputMetadata inputMetadata = tuple2.f0;
                     final HashMap<String, Long> inputMetadataTimingMap = inputMetadata.getTimingMap();
                     long generatedTS = inputMetadataTimingMap.get("Generated");
-                    long t = System.currentTimeMillis();
-                    inputMetadataTimingMap.put("BeforeReadImage", t);
-                    long diff = t - generatedTS;
+
+                    final CameraWithCube cameraWithCube = tuple2.f1;
+                    final HashMap<String, Long> cameraWithCubeTimingMap = cameraWithCube.getTimingMap();
+                    long afterCopyImageTS = cameraWithCubeTimingMap.get("AfterCopyImage");
+                    long startOfReadImageTS = System.currentTimeMillis();
+                    long timeAfterCopyToStartOfReadImage = startOfReadImageTS - afterCopyImageTS;
+                    this.histogram.update(timeAfterCopyToStartOfReadImage);
+
+                    inputMetadataTimingMap.put("BeforeReadImage", startOfReadImageTS);
+                    long diff = startOfReadImageTS - generatedTS;
                     if (diff > 500) {
                         logger.error("ReadImage Diff for GeneratedTS:{} is:{} which is > 500 ms", generatedTS, diff);
                         //TODO: size of queue?
                         inputMetadataTimingMap.put("AfterReadImage", -1L);
                     } else {
                         String checkStrValue = nativeLoaderRead.readImage(deadlineDuration, camFileLocation, 0, 0, 10, 5, options);
+                        if (checkStrValue != null && checkStrValue.startsWith("ERROR")) {
+                            logger.error("Error readImage:%s for InputMetadata:%s", checkStrValue, tuple2.f0);
+                            inputMetadata.getTimingMap().put("Error", -1L);
+                        }
                         inputMetadataTimingMap.put("AfterReadImage", System.currentTimeMillis());
                         writeInputMetadataCsv(tuple2);
                         logger.info("readImage checkStrValue: {}", checkStrValue);
@@ -559,7 +606,7 @@ public class MapTwoStreamsDemo1 {
         private MapState<CameraWithCube.CameraKey, CameraWithCube> cameraWithCubeState;
 
         /**
-         * Register all State declaration
+         * Register all State declaration.
          *
          * @param config Configuration
          */
@@ -655,11 +702,9 @@ public class MapTwoStreamsDemo1 {
                                     logger.info("$$$$$[flatMap1]Release Countdown latch with inputMetadata Collecting existingInputMetadata:{}, cameraWithCube:{}", existingInputMetadata, cameraWithCube);
                                     long t = System.currentTimeMillis();
                                     existingInputMetadata.getTimingMap().put("OutOfLatch", t);
-                                    //cameraWithCube.getTimingMap().put("OutOfLatch", t);//TODO: is this needed ?
 
                                     Tuple2<InputMetadata, CameraWithCube> tuple2 = new Tuple2<>(existingInputMetadata, cameraWithCube);
                                     collector.collect(tuple2);
-                                    //writeCameraCsv(tuple2.f1, outputPath);
 
                                 } else {
                                     logger.debug("!!!!![flatMap1]  with inputMetadata reducing count:{} ,existingInputMetadata:{}, cameraWithCube:{}", existingInputMetadata.count, existingInputMetadata, cameraWithCube);
@@ -700,7 +745,6 @@ public class MapTwoStreamsDemo1 {
 
                             }
                         }
-
 
                         if (existingCameraWithCubeLst.size() == 0) {
                             //if no cubeLst and tileExists=true, remove the key from the camera state ???
