@@ -33,8 +33,8 @@ public class ImageRefClient {
     private static final Logger logger = LoggerFactory.getLogger(ImageRefClient.class);
 
     private static ManagedChannel channel;
-    private static String host;
-    private static int port;
+    private final String host;
+    private final int port;
 
     public ImageRefClient(String host, int port) {
         this.host = host;
@@ -65,7 +65,7 @@ public class ImageRefClient {
         ImageRefClient imageRefClient = new ImageRefClient(host, port);
         logger.debug("Creating Image service client stub");
         //DummyServiceGrpc.DummyServiceBlockingStub syncClient = DummyServiceGrpc.newBlockingStub(channel);
-        //DummyServiceGrpc.DummyServiceFutureStub asyncClient = DummyServiceGrpc.newFutureStub(channel);//TODO:
+        //DummyServiceGrpc.DummyServiceFutureStub asyncClient = DummyServiceGrpc.newFutureStub(channel);
         //final ImageServiceGrpc.ImageServiceStub asyncClient = ImageServiceGrpc.newStub(channel);
 
 
@@ -80,14 +80,11 @@ public class ImageRefClient {
             for (int i = 0; i < 4; i++) {
                 logger.debug("copyImageSync Create request with count:" + i);
                 options = UUID.randomUUID().toString();
-                //makes a connection each time - handle with a single channel creation
                 imageRefClient.copyImageSync(deadlineDuration, inputFile + i, fileLocation + i, options, channel);
                 imageRefClient.readImageSync(deadlineDuration,  fileLocation + i, roi, options, channel);
             }
-            //TODO: how to wait for response before calling channel shutdown
             //copyImageAsync(asyncClient, deadlineDuration,latch, inputFile, fileLocation, options,channel);
         } finally {
-            //TODO: channel shutdown
             logger.debug("Shutting down Channel");
             channel.shutdown();
         }
@@ -157,11 +154,10 @@ public class ImageRefClient {
                         }
                     }, MoreExecutors.directExecutor());
 
-            //TODO: shud i put in finally
             if (!Uninterruptibles.awaitUninterruptibly(latch, 1, TimeUnit.SECONDS)) {
                 throw new RuntimeException("copyImageFutureAsync - latch timeout!");
             }
-        } catch (StatusRuntimeException e) { //TODO:StatusRuntimeException
+        } catch (StatusRuntimeException e) { //catch exceptions from gRPC server
             if (e.getStatus().getCode() == Status.Code.DEADLINE_EXCEEDED) {
                 logger.debug("Deadline has been exceeded, we don't want the response");
             } else {
@@ -178,7 +174,7 @@ public class ImageRefClient {
         logger.debug("Entered copyImageReqStreamAsync()");
         ManagedChannel channel = getManagedChannel(host, port);
         int count = 4;
-        CountDownLatch latch = new CountDownLatch(count);//TODO: unbounded ???
+        CountDownLatch latch = new CountDownLatch(count);//TODO: unbounded count
         Map<String, ArrayList<String>> requestMap = new HashMap<>();
         try {
             //asynchronous client
@@ -233,11 +229,10 @@ public class ImageRefClient {
             //done with request - else keep it open
             requestCopyObserver.onCompleted();
 
-            //TODO: shud i put in finally
             if (!Uninterruptibles.awaitUninterruptibly(latch, 500, TimeUnit.SECONDS)) { //TODO: Latch timeout as parm
                 throw new RuntimeException("copyImageReqStreamAsync - latch timeout!");
             }
-        } catch (StatusRuntimeException e) { //TODO:StatusRuntimeException
+        } catch (StatusRuntimeException e) {
             if (e.getStatus().getCode() == Status.Code.DEADLINE_EXCEEDED) {
                 logger.debug("Deadline has been exceeded, we don't want the response");
             } else {
@@ -270,7 +265,6 @@ public class ImageRefClient {
                         @Override
                         public void onNext(CopyImageResponse value) {
                             logger.debug("copyImageBidiAsync Response from server:" + value.getResult());
-                            //TODO: match with requestMap for options as key
                         }
 
                         @Override
@@ -341,16 +335,15 @@ public class ImageRefClient {
                     .setFileLocation(fileLocation)
                     .setOptions(options)
                     .build();
-            CopyImageResponse copyImageResponse = imageClient.withDeadline(Deadline.after(deadlineDuration, TimeUnit.SECONDS)) //TODO: determine deadline Duration
+            CopyImageResponse copyImageResponse = imageClient.withDeadline(Deadline.after(deadlineDuration, TimeUnit.SECONDS))
                     .copyImage(copyImageRequest);
             logger.debug("copyImageResponse:" + copyImageResponse.getResult());
-            return copyImageResponse.getResult();//TODO: parse CopyImageResponse
-        } catch (StatusRuntimeException e) { //TODO:StatusRuntimeException
+            return copyImageResponse.getResult();
+        } catch (StatusRuntimeException e) {
             if (e.getStatus().getCode() == Status.Code.DEADLINE_EXCEEDED) {
                 logger.error("Deadline has been exceeded, we don't want the response");
             } else {
                 logger.error("StatusRuntimeException:" + e.getStatus());
-                //TODO: build retry logic
                 e.printStackTrace();
             }
         } finally {
@@ -379,13 +372,12 @@ public class ImageRefClient {
             ReadImageResponse readImageResponse = imageClient.withDeadline(Deadline.after(deadlineDuration, TimeUnit.SECONDS)) //TODO: determine deadline Duration
                     .readImage(readImageRequest);
             logger.debug("readImageResponse:" + readImageResponse.getResult());
-            return readImageResponse.getResult();//TODO: parse ReadImageResponse
-        } catch (StatusRuntimeException e) { //TODO:StatusRuntimeException
+            return readImageResponse.getResult();
+        } catch (StatusRuntimeException e) {
             if (e.getStatus().getCode() == Status.Code.DEADLINE_EXCEEDED) {
                 logger.debug("Deadline has been exceeded, we don't want the response");
             } else {
                 logger.error("StatusRuntimeException:" + e.getStatus());//Status{code=UNAVAILABLE,
-                //TODO: build retry logic
                 e.printStackTrace();
             }
         } finally {

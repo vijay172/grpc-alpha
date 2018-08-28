@@ -10,7 +10,6 @@ import org.apache.flink.dropwizard.metrics.DropwizardHistogramWrapper;
 import org.apache.flink.dropwizard.metrics.DropwizardMeterWrapper;
 import org.apache.flink.metrics.Histogram;
 import org.apache.flink.metrics.Meter;
-import org.apache.flink.runtime.metrics.DescriptiveStatisticsHistogram;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.AsyncDataStream;
 import org.apache.flink.streaming.api.datastream.DataStream;
@@ -103,6 +102,8 @@ public class MapTwoStreamsDemo1 {
             env = StreamExecutionEnvironment.getExecutionEnvironment();
         }
         env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime); //EventTime not needed here as we are not dealing with EventTime timestamps
+        // register the Google Protobuf serializer with Kryo
+        //env.getConfig().registerTypeWithKryoSerializer(MyCustomType.class, ProtobufSerializer.class);
         //TODO: restart and checkpointing strategies
         /*env.setRestartStrategy(RestartStrategies.failureRateRestart(10, Time.minutes(1), Time.milliseconds(100)));
         env.enableCheckpointing(100);*/
@@ -205,7 +206,7 @@ public class MapTwoStreamsDemo1 {
         private final long deadlineDuration;
 
         private transient Histogram histogram;
-        private transient Histogram descrHistogram;
+        private transient Histogram beforeCopyDiffGeneratedHistogram;
 
         SampleCopyAsyncFunction(final String host, final int port, final long shutdownWaitTS, final String inputFile,
                                 final String options, final int nThreads, final long deadlineDuration) {
@@ -237,11 +238,11 @@ public class MapTwoStreamsDemo1 {
                     .getMetricGroup()
                     .addGroup("CopyMetrics")
                     .histogram("copyImageMetrics", new DropwizardHistogramWrapper(dropwizardHistogram));
-
-            this.descrHistogram = getRuntimeContext()
+            this.beforeCopyDiffGeneratedHistogram = getRuntimeContext()
                     .getMetricGroup()
-                    .addGroup("CopyMetricsDescr")
-                    .histogram("copyImageDescrMetrics", new DescriptiveStatisticsHistogram(500));
+                    .addGroup("DiffOfCopyAndGeneratedMetrics")
+                    .histogram("diffOfCopyAndGeneratedMetrics", new DropwizardHistogramWrapper(dropwizardHistogram));
+
         }
 
         @Override
@@ -273,7 +274,6 @@ public class MapTwoStreamsDemo1 {
          *
          * @param cameraWithCube input - Emitter value
          * @param resultFuture   output async Collector of the result when query returns - Wrap Emitter in a Promise/Future
-         * @throws Exception exception thrown
          */
         @Override
         public void asyncInvoke(final CameraWithCube cameraWithCube, final ResultFuture<CameraWithCube> resultFuture) {
@@ -289,10 +289,11 @@ public class MapTwoStreamsDemo1 {
                     final HashMap<String, Long> cameraWithCubeTimingMap = cameraWithCube.getTimingMap();
                     long generatedTS = cameraWithCubeTimingMap.get("Generated");
                     cameraWithCubeTimingMap.put("BeforeCopyImage", beforeCopyImageTS);
-                    long diff = beforeCopyImageTS - generatedTS;
-                    if (diff > 500) {
+                    long diffOfCopyToGenerated = beforeCopyImageTS - generatedTS;
+                    this.beforeCopyDiffGeneratedHistogram.update(diffOfCopyToGenerated);
+                    if (diffOfCopyToGenerated > 500) {
                         //print error msg in log & size of queue? & AfterCopyImage -1 & emit it
-                        logger.error("CopyImage Diff for GeneratedTS:{} is:{} which is > 500 ms", generatedTS, diff);
+                        logger.error("CopyImage Diff from BeforeCopyImage for GeneratedTS:{} is:{} which is > 500 ms", generatedTS, diffOfCopyToGenerated);
                         //size of queue?
                         cameraWithCubeTimingMap.put("AfterCopyImage", -1L);
                     } else {
@@ -306,7 +307,6 @@ public class MapTwoStreamsDemo1 {
                         long afterCopyImageTS = System.currentTimeMillis();
                         long timeTakenForCopyImage = afterCopyImageTS - beforeCopyImageTS;
                         this.histogram.update(timeTakenForCopyImage);
-                        this.descrHistogram.update(timeTakenForCopyImage);
                         cameraWithCubeTimingMap.put("AfterCopyImage", afterCopyImageTS);
                         logger.info("copyImage checkStrValue: {}", checkStrValue);
                         logger.debug("SampleCopyAsyncFunction - after JNI copyImage to copy S3 file to EFS with efsLocation:{}", outputFile1);
@@ -339,12 +339,13 @@ public class MapTwoStreamsDemo1 {
         private final int port;
         private final long deadlineDuration;
         private transient Histogram histogram;
+        private transient Histogram diffOfAfterReadToBeforeHistogram;
 
         private static NativeLoader nativeLoaderRead;
 
-        public SampleSinkAsyncFunction(final String host, final int port, final long shutdownWaitTS,
-                                       final String outputPath, final String options, final int nThreads,
-                                       final String uuid, final long deadlineDuration) {
+        SampleSinkAsyncFunction(final String host, final int port, final long shutdownWaitTS,
+                                final String outputPath, final String options, final int nThreads,
+                                final String uuid, final long deadlineDuration) {
             this.options = options;
             this.outputPath = outputPath;
             this.uuid = uuid;
@@ -375,6 +376,10 @@ public class MapTwoStreamsDemo1 {
                     .getMetricGroup()
                     .addGroup("ReadMetrics")
                     .histogram("readImageMetrics", new DropwizardHistogramWrapper(dropwizardHistogram));
+            this.diffOfAfterReadToBeforeHistogram = getRuntimeContext()
+                    .getMetricGroup()
+                    .addGroup("diffOfAfterReadImageToBeforeReadImageHistogramMetrics")
+                    .histogram("diffOfAfterReadImageToBeforeReadImageHistogramMetrics", new DropwizardHistogramWrapper(dropwizardHistogram));
 
             synchronized (SampleSinkAsyncFunction.class) {
                 if (counter1 == 0) {
@@ -433,32 +438,31 @@ public class MapTwoStreamsDemo1 {
                     String camFileLocation = cameraTuple.getCamFileLocation();
                     logger.info("SampleSinkAsyncFunction - before JNI readImage to retrieve EFS file from camFileLocation: {}", camFileLocation);
                     logger.debug("tuple2.f0:{}, tuple2.f1:{}, options:{}", tuple2.f0, tuple2.f1, options);
-                    //TODO: change to use ROI values ??
                     InputMetadata inputMetadata = tuple2.f0;
                     final HashMap<String, Long> inputMetadataTimingMap = inputMetadata.getTimingMap();
                     long generatedTS = inputMetadataTimingMap.get("Generated");
-
+                    long startOfReadImageTS = System.currentTimeMillis();
+                    /*
                     final CameraWithCube cameraWithCube = tuple2.f1;
                     final HashMap<String, Long> cameraWithCubeTimingMap = cameraWithCube.getTimingMap();
                     long afterCopyImageTS = cameraWithCubeTimingMap.get("AfterCopyImage");
-                    long startOfReadImageTS = System.currentTimeMillis();
                     long timeAfterCopyToStartOfReadImage = startOfReadImageTS - afterCopyImageTS;
                     this.histogram.update(timeAfterCopyToStartOfReadImage);
+                    inputMetadataTimingMap.put("BeforeReadImage", startOfReadImageTS);*/
 
-                    inputMetadataTimingMap.put("BeforeReadImage", startOfReadImageTS);
                     long diff = startOfReadImageTS - generatedTS;
-                    if (diff > 500) {
+                    if (diff > 20500) { //TODO: diff changed from 500
                         logger.error("ReadImage Diff for GeneratedTS:{} is:{} which is > 500 ms", generatedTS, diff);
                         //TODO: size of queue?
-                        inputMetadataTimingMap.put("AfterReadImage", -1L);
+                        //inputMetadataTimingMap.put("AfterReadImage", -1L);
                     } else {
                         String checkStrValue = nativeLoaderRead.readImage(deadlineDuration, camFileLocation, 0, 0, 10, 5, options);
                         if (checkStrValue != null && checkStrValue.startsWith("ERROR")) {
                             logger.error("Error readImage:%s for InputMetadata:%s", checkStrValue, tuple2.f0);
-                            inputMetadata.getTimingMap().put("Error", -1L);
+                            inputMetadataTimingMap.put("Error", -1L);
                         }
-                        inputMetadataTimingMap.put("AfterReadImage", System.currentTimeMillis());
-                        writeInputMetadataCsv(tuple2);
+                        //inputMetadataTimingMap.put("AfterReadImage", System.currentTimeMillis());
+                        //writeInputMetadataCsv(tuple2);
                         logger.info("readImage checkStrValue: {}", checkStrValue);
                         logger.debug("SampleSinkAsyncFunction - after JNI readImage to retrieve EFS file from camFileLocation: {}", camFileLocation);
                     }
@@ -482,6 +486,20 @@ public class MapTwoStreamsDemo1 {
             //read all 38 cameras for 1 cube in 38 threads
             //tuple2.f0.cameraLst[i].camFileLocation for each 38 cameras within 1 cube/InputMetadata
             try {
+                InputMetadata inputMetadata = tuple2.f0;
+                final HashMap<String, Long> inputMetadataTimingMap = inputMetadata.getTimingMap();
+
+                final CameraWithCube cameraWithCube = tuple2.f1;
+                final HashMap<String, Long> cameraWithCubeTimingMap = cameraWithCube.getTimingMap();
+                logger.debug("cameraWithCubeTimingMap:{}", cameraWithCubeTimingMap);
+                long afterCopyImageTS = cameraWithCubeTimingMap != null ?
+                        cameraWithCubeTimingMap.get("AfterCopyImage") != null ? cameraWithCubeTimingMap.get("AfterCopyImage") : System.currentTimeMillis()
+                        : System.currentTimeMillis();//TODO: what to put here when cameraWithCubeTimingMap = null
+                long startOfReadImageTS = System.currentTimeMillis();
+                long timeAfterCopyToStartOfReadImage = startOfReadImageTS - afterCopyImageTS;
+                this.histogram.update(timeAfterCopyToStartOfReadImage);
+                inputMetadataTimingMap.put("BeforeReadImage", startOfReadImageTS);
+
                 final List<CameraTuple> cameraTupleList = tuple2.f0.cameraLst;
                 //read all camera images within cameraLst of InputMetadata async
                 final List<CompletableFuture<Tuple2<InputMetadata, CameraWithCube>>> completableReadFutures = cameraTupleList.stream()
@@ -491,6 +509,7 @@ public class MapTwoStreamsDemo1 {
                 //Create a combined Future using allOf which return Void
                 final CompletableFuture<Void> allCompletableReadFutures = CompletableFuture.allOf(completableReadFutures
                         .toArray(new CompletableFuture[completableReadFutures.size()]));
+                //Need to do below as CompletableFuture.allOf() returns CompletableFuture<Void>
                 //When all Futures are completed, call `future.join()` to get their results & collect the results in a List
                 //join is called when all futures are complete, so no blocking anywhere
                 //TODO: join throws an unchecked exception if the underlying CompletableFuture completes exceptionally.
@@ -503,9 +522,23 @@ public class MapTwoStreamsDemo1 {
                 //hence use thenAccept which accepts a Consumer with args with nothing returned
                 allReadFutures.thenAccept(inputTupleList -> {
                     logger.info("All read image futures completed for camera list within Inputmetadata");
+                    long afterReadImageTS = System.currentTimeMillis();
+                    inputMetadataTimingMap.put("AfterReadImage", afterReadImageTS);
+                    long diffOfAfterReadToBeforeReadTS = afterReadImageTS - startOfReadImageTS;
+                    this.diffOfAfterReadToBeforeHistogram.update(diffOfAfterReadToBeforeReadTS);
+                    writeInputMetadataCsv(tuple2);
                     resultFuture.complete(
                             Collections.singletonList(tuple2));
                 });
+
+                /*final CompletableFuture<Void> allCompletableReadFutures = CompletableFuture.allOf(completableReadFutures
+                        .toArray(new CompletableFuture[completableReadFutures.size()]));
+                allCompletableReadFutures.get();//blocking
+                logger.info("All read image futures completed for camera list within Inputmetadata");
+                inputMetadataTimingMap.put("AfterReadImage", System.currentTimeMillis());
+                resultFuture.complete(
+                        Collections.singletonList(tuple2));*/
+
             } catch (Exception e) {
                 logger.error("SampleSinkAsyncFunction - Exception while making readImage call in async call: {}", e);
                 resultFuture.complete(new ArrayList<>(0));
@@ -591,7 +624,7 @@ public class MapTwoStreamsDemo1 {
         ICsvMapWriter csvCameraMapWriter = null;
         private final String uuid;
 
-        public SyncLatchFunction(final String outputFile, final String outputPath, final String uuid) {
+        SyncLatchFunction(final String outputFile, final String outputPath, final String uuid) {
             this.outputFile = outputFile;
             this.outputPath = outputPath;
             this.uuid = uuid;
@@ -736,7 +769,6 @@ public class MapTwoStreamsDemo1 {
                                         //cameraWithCube.getTimingMap().put("OutOfLatch", t);
                                         Tuple2<InputMetadata, CameraWithCube> tuple2 = new Tuple2<>(existingInputMetadata, cameraWithCube);
                                         collector.collect(tuple2);
-                                        //writeCameraCsv(tuple2.f1, outputPath);
 
                                     } else {
                                         logger.debug("$$$$$[flatMap1]  with inputMetadata reducing count existingInputMetadata.count:{}, cameraWithCube:{}", existingInputMetadata.count, cameraWithCube);
@@ -832,19 +864,11 @@ public class MapTwoStreamsDemo1 {
                                 logger.info("$$$$$[flatMap2] Release Countdown latch with Camera data Collecting existingInputMetadata:{}, cameraWithCube:{}", existingInputMetadata, cameraWithCube);
                                 long t = System.currentTimeMillis();
                                 existingInputMetadata.getTimingMap().put("OutOfLatch", t);
-                                //cameraWithCube.getTimingMap().put("OutOfLatch", t);
                                 Tuple2<InputMetadata, CameraWithCube> tuple2 = new Tuple2<>(existingInputMetadata, cameraWithCube);
                                 collector.collect(tuple2);
-                                //writeCameraCsv(tuple2.f1, outputPath);
-                                //remove from inputMetadata state if count is 0
-                                //TODO: combine all inputMetadataState into 1 update operation for performance
-                                //TODO:put this remove back in
-                                //inputMetadataState.remove(existingMetadataKey);
                             } else {
                                 //updated reduced count in inputMetadata
                                 inputMetadataState.put(existingMetadataKey, existingInputMetadata);
-                                //Tuple2<InputMetadata, CameraWithCube> tuple2 = new Tuple2<>(existingInputMetadata, cameraWithCube);
-                                //writeCameraCsv(tuple2.f1, outputPath);
                                 logger.debug("$$$$$[flatMap2] with Camera data reducing count of existingInputMetadata:{}", existingInputMetadata);
                             }
                         }
