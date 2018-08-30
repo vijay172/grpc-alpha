@@ -1,7 +1,9 @@
 package com.intel.flink.state;
 
+import org.apache.flink.api.common.restartstrategy.RestartStrategies;
 import org.apache.flink.api.common.state.MapState;
 import org.apache.flink.api.common.state.MapStateDescriptor;
+import org.apache.flink.api.common.time.Time;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.utils.ParameterTool;
 import org.apache.flink.configuration.Configuration;
@@ -10,6 +12,8 @@ import org.apache.flink.dropwizard.metrics.DropwizardHistogramWrapper;
 import org.apache.flink.dropwizard.metrics.DropwizardMeterWrapper;
 import org.apache.flink.metrics.Histogram;
 import org.apache.flink.metrics.Meter;
+import org.apache.flink.runtime.state.filesystem.FsStateBackend;
+import org.apache.flink.streaming.api.CheckpointingMode;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.AsyncDataStream;
 import org.apache.flink.streaming.api.datastream.DataStream;
@@ -27,6 +31,8 @@ import com.intel.flink.datatypes.InputMetadata;
 import com.intel.flink.jni.NativeLoader;
 import com.intel.flink.sources.CheckpointedCameraWithCubeSource;
 import com.intel.flink.sources.CheckpointedInputMetadataSource;
+import com.intel.flink.utils.CameraAssigner;
+import com.intel.flink.utils.InputMetadataAssigner;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.supercsv.cellprocessor.constraint.NotNull;
@@ -98,13 +104,18 @@ public class MapTwoStreamsDemo1 {
             Configuration configuration = new Configuration();
             configuration.setInteger(TaskManagerOptions.NUM_TASK_SLOTS, 2);
             env = StreamExecutionEnvironment.createLocalEnvironment(1, configuration);
+            env.setStateBackend(new FsStateBackend("file:///tmp/checkpoints"));//TODO: parm
         } else {
             env = StreamExecutionEnvironment.getExecutionEnvironment();
         }
-        env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime); //EventTime not needed here as we are not dealing with EventTime timestamps
+        env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
         // register the Google Protobuf serializer with Kryo
         //env.getConfig().registerTypeWithKryoSerializer(MyCustomType.class, ProtobufSerializer.class);
         //TODO: restart and checkpointing strategies
+        // set up checkpointing
+
+        //env.enableCheckpointing(10000L);
+        //env.setRestartStrategy(RestartStrategies.fixedDelayRestart(2, Time.of(10, TimeUnit.SECONDS)));//changed from 60 to 3 for restartAttempts
         /*env.setRestartStrategy(RestartStrategies.failureRateRestart(10, Time.minutes(1), Time.milliseconds(100)));
         env.enableCheckpointing(100);*/
         //env.enableCheckpointing(10000L, CheckpointingMode.AT_LEAST_ONCE);
@@ -116,6 +127,7 @@ public class MapTwoStreamsDemo1 {
         DataStream<InputMetadata> inputMetadataDataStream = env
                 .addSource(new CheckpointedInputMetadataSource(maxSeqCnt, servingSpeedMs, startTime, nbrCubes, nbrCameraTuples, sourceDelay, outputFile), "InputMetadata")
                 .uid("InputMetadata")
+                .assignTimestampsAndWatermarks(new InputMetadataAssigner())
                 .keyBy((inputMetadata) ->
                         inputMetadata.inputMetadataKey != null ? inputMetadata.inputMetadataKey.ts : new Object());
         logger.debug("past inputMetadataFile source");
@@ -123,6 +135,7 @@ public class MapTwoStreamsDemo1 {
         DataStream<CameraWithCube> keyedByCamCameraStream = env
                 .addSource(new CheckpointedCameraWithCubeSource(maxSeqCnt, servingSpeedMs, startTime, nbrCameras, outputFile, sourceDelay), "TileDB Camera")
                 .uid("TileDB-Camera")
+                .assignTimestampsAndWatermarks(new CameraAssigner())
                 .setParallelism(1);
 
         DataStream<CameraWithCube> cameraWithCubeDataStream;
@@ -138,7 +151,7 @@ public class MapTwoStreamsDemo1 {
                     AsyncDataStream.unorderedWait(keyedByCamCameraStream, cameraWithCubeAsyncFunction, timeout, TimeUnit.MILLISECONDS, nCapacity)
                             .slotSharingGroup(copySlotSharingGroup)
                             .setParallelism(parallelCamTasks)
-                            .rebalance();//.startNewChain()
+                            .rebalance();
             cameraWithCubeDataStream = cameraWithCubeDataStreamAsync.keyBy((cameraWithCube) -> cameraWithCube.cameraKey != null ?
                     cameraWithCube.cameraKey.getTs() : new Object());
         } else {

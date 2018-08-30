@@ -1,15 +1,19 @@
 package com.intel.flink.sources;
 
+import org.apache.flink.streaming.api.checkpoint.ListCheckpointed;
 import org.apache.flink.streaming.api.functions.source.SourceFunction;
 
 import com.intel.flink.datatypes.CameraWithCube;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Collections;
+import java.util.List;
+
 /**
  *
  */
-public class CheckpointedCameraWithCubeSource implements SourceFunction<CameraWithCube> {
+public class CheckpointedCameraWithCubeSource implements SourceFunction<CameraWithCube>, ListCheckpointed<Long> {
     private static final Logger logger = LoggerFactory.getLogger(CheckpointedCameraWithCubeSource.class);
 
     private final long maxSeqCnt;
@@ -33,6 +37,10 @@ public class CheckpointedCameraWithCubeSource implements SourceFunction<CameraWi
 
 
     private boolean running = true;
+
+    // state
+    // number of emitted events
+    private long eventCnt = 0;
 
     public CheckpointedCameraWithCubeSource() {
         this(MAX_SEQ_CNT, SERVING_SPEED_FREQ_MILLIS, System.currentTimeMillis(), NBR_OF_CAMERAS, "", SOURCE_DELAY);
@@ -74,6 +82,13 @@ public class CheckpointedCameraWithCubeSource implements SourceFunction<CameraWi
         final CameraWithCube camWithCube = new CameraWithCube();
         final CameraWithCube.CameraKey cameraKey = new CameraWithCube.CameraKey(); //mutable
         long seqCnt = 0;
+        long cnt = 0;
+        //skip emitted events using seqCnt
+        while (cnt < eventCnt) {
+            cnt++;
+            seqCnt++;
+        }
+        //emit all subsequent events from seqCnt onwards
         while (running) {
             for (; seqCnt < maxSeqCnt; seqCnt++) {
                 cameraKey.ts = seqCnt;
@@ -89,6 +104,7 @@ public class CheckpointedCameraWithCubeSource implements SourceFunction<CameraWi
                         //insert createTS
                         camWithCube.getTimingMap().put("Generated", System.currentTimeMillis());
                         //camWithCube.setCreateTS(createTS)
+                        eventCnt++;
                         sourceContext.collect(camWithCube);
                     }
                     logger.debug("CameraSource - Emitting each Camera event {}", camWithCube);
@@ -111,5 +127,17 @@ public class CheckpointedCameraWithCubeSource implements SourceFunction<CameraWi
     @Override
     public void cancel() {
         running= false;
+    }
+
+    @Override
+    public List<Long> snapshotState(long checkpointId, long checkpointTimestamp) throws Exception {
+        return Collections.singletonList(eventCnt);
+    }
+
+    @Override
+    public void restoreState(List<Long> state) throws Exception {
+        for (Long s:state) {
+            this.eventCnt = s;
+        }
     }
 }
