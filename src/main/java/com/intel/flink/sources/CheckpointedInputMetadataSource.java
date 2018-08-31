@@ -1,5 +1,7 @@
 package com.intel.flink.sources;
 
+import org.apache.flink.runtime.state.CheckpointListener;
+import org.apache.flink.streaming.api.checkpoint.ListCheckpointed;
 import org.apache.flink.streaming.api.functions.source.SourceFunction;
 
 import com.intel.flink.datatypes.CameraTuple;
@@ -8,6 +10,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -15,7 +18,7 @@ import java.util.List;
  * Source operates in event-time.
  *
  */
-public class CheckpointedInputMetadataSource implements SourceFunction<InputMetadata> {
+public class CheckpointedInputMetadataSource implements SourceFunction<InputMetadata>, ListCheckpointed<Long>, CheckpointListener {
     private static final Logger logger = LoggerFactory.getLogger(CheckpointedInputMetadataSource.class);
 
     private final long maxSeqCnt;
@@ -43,7 +46,11 @@ public class CheckpointedInputMetadataSource implements SourceFunction<InputMeta
     private static final String FILE_LOCATION = "file:///tmp";
 
 
-    private boolean running = true;
+    private volatile boolean running = true;
+
+    // state
+    // number of emitted events
+    private long eventCnt = 0;
 
     public CheckpointedInputMetadataSource() {
         this(MAX_SEQ_CNT, SERVING_SPEED_FREQ_MILLIS, System.currentTimeMillis(), NBR_OF_CUBES, NBR_OF_CAMERA_TUPLES, SOURCE_DELAY, FILE_LOCATION);
@@ -88,6 +95,13 @@ public class CheckpointedInputMetadataSource implements SourceFunction<InputMeta
         final InputMetadata.InputMetadataKey inputMetadataKey = new InputMetadata.InputMetadataKey();
 
         long seqCnt = 0;
+        long cnt = 0;
+        //skip emitted events using seqCnt
+        while (cnt < eventCnt) {
+            cnt++;
+            seqCnt++;
+        }
+        //emit all subsequent events from seqCnt onwards
         while (running) {
             for (; seqCnt < maxSeqCnt; seqCnt++) {
                 inputMetadataKey.ts = seqCnt;
@@ -108,6 +122,7 @@ public class CheckpointedInputMetadataSource implements SourceFunction<InputMeta
                     inputMetadata.setCameraLst(cameraTupleList);
                     synchronized (lock) {
                         inputMetadata.getTimingMap().put("Generated", System.currentTimeMillis());
+                        eventCnt++;
                         sourceContext.collect(inputMetadata);
                     }
                     logger.debug("InputMetadataSource - Emitting each InputMetadata event {}", inputMetadata);
@@ -132,4 +147,21 @@ public class CheckpointedInputMetadataSource implements SourceFunction<InputMeta
         running = false;
     }
 
+    @Override
+    public List<Long> snapshotState(long checkpointId, long checkpointTimestamp) throws Exception {
+        //if state is not re-partitonable, return a singleton Collections
+        return Collections.singletonList(eventCnt);
+    }
+
+    @Override
+    public void restoreState(List<Long> state) throws Exception {
+        for (Long s:state) {
+            this.eventCnt = s;
+        }
+    }
+
+    @Override
+    public void notifyCheckpointComplete(long checkpointId) throws Exception {
+        logger.debug("InputmetadataSource-checkpoint complete for checkpointId:{}", checkpointId);
+    }
 }

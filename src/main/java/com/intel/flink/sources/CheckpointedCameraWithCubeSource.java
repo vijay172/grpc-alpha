@@ -1,5 +1,6 @@
 package com.intel.flink.sources;
 
+import org.apache.flink.runtime.state.CheckpointListener;
 import org.apache.flink.streaming.api.checkpoint.ListCheckpointed;
 import org.apache.flink.streaming.api.functions.source.SourceFunction;
 
@@ -13,7 +14,7 @@ import java.util.List;
 /**
  *
  */
-public class CheckpointedCameraWithCubeSource implements SourceFunction<CameraWithCube>, ListCheckpointed<Long> {
+public class CheckpointedCameraWithCubeSource implements SourceFunction<CameraWithCube>, ListCheckpointed<Long>, CheckpointListener {
     private static final Logger logger = LoggerFactory.getLogger(CheckpointedCameraWithCubeSource.class);
 
     private final long maxSeqCnt;
@@ -36,10 +37,16 @@ public class CheckpointedCameraWithCubeSource implements SourceFunction<CameraWi
     private static final int SOURCE_DELAY = 15000;
 
 
-    private boolean running = true;
+    private volatile boolean running = true;
 
     // state
     // number of emitted events
+    //TODO: Does this need to be stored ina  ListState<Long>
+    /*
+    val desc = new ListStateDescriptor[Long]("offset", classOf[Long])
+    offsetState = initCtx.getOperatorStateStore.getListState(desc)
+    val it = offsetState.get()
+     */
     private long eventCnt = 0;
 
     public CheckpointedCameraWithCubeSource() {
@@ -75,7 +82,11 @@ public class CheckpointedCameraWithCubeSource implements SourceFunction<CameraWi
         this.sourceDelay = sourceDelay;
     }
 
-
+    /**
+     * This runs in a separate thread.
+     * @param sourceContext
+     * @throws Exception
+     */
     @Override
     public void run(SourceContext<CameraWithCube> sourceContext) throws Exception {
         final Object lock = sourceContext.getCheckpointLock();
@@ -129,6 +140,13 @@ public class CheckpointedCameraWithCubeSource implements SourceFunction<CameraWi
         running= false;
     }
 
+    /**
+     * When Checkpoint is taken, this method is called
+     * @param checkpointId
+     * @param checkpointTimestamp
+     * @return
+     * @throws Exception
+     */
     @Override
     public List<Long> snapshotState(long checkpointId, long checkpointTimestamp) throws Exception {
         return Collections.singletonList(eventCnt);
@@ -139,5 +157,10 @@ public class CheckpointedCameraWithCubeSource implements SourceFunction<CameraWi
         for (Long s:state) {
             this.eventCnt = s;
         }
+    }
+
+    @Override
+    public void notifyCheckpointComplete(long checkpointId) throws Exception {
+        logger.debug("CameraSource-checkpoint complete for checkpointId:{}", checkpointId);
     }
 }

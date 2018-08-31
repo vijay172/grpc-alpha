@@ -11,10 +11,16 @@ import com.intel.flink.datatypes.CameraWithCube;
  */
 public class CameraAssigner implements AssignerWithPunctuatedWatermarks<CameraWithCube> {
 
+    /**
+     * checkAndGetNextWatermark() method which is called for each event right after extractTimestamp()
+     * @param cameraWithCube
+     * @param extractedTimestamp
+     * @return
+     */
     @Override
     public Watermark checkAndGetNextWatermark(CameraWithCube cameraWithCube, long extractedTimestamp) {
-        //simply emit a Watermark with every event
-        return new Watermark(extractedTimestamp - 30000);
+        //simply emit a Watermark with every event with a tolerance interval of 30secs
+        return new Watermark(extractedTimestamp - 30000); //30000 ms
     }
 
     @Override

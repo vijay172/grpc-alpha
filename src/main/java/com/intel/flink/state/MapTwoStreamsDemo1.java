@@ -41,6 +41,7 @@ import org.supercsv.io.CsvMapWriter;
 import org.supercsv.io.ICsvMapWriter;
 import org.supercsv.prefs.CsvPreference;
 
+import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -104,18 +105,19 @@ public class MapTwoStreamsDemo1 {
             Configuration configuration = new Configuration();
             configuration.setInteger(TaskManagerOptions.NUM_TASK_SLOTS, 2);
             env = StreamExecutionEnvironment.createLocalEnvironment(1, configuration);
-            env.setStateBackend(new FsStateBackend("file:///tmp/checkpoints"));//TODO: parm
+            env.setStateBackend(new FsStateBackend("file:///tmp/checkpoints", true));//TODO: parm
         } else {
             env = StreamExecutionEnvironment.getExecutionEnvironment();
         }
         env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
         // register the Google Protobuf serializer with Kryo
         //env.getConfig().registerTypeWithKryoSerializer(MyCustomType.class, ProtobufSerializer.class);
-        //TODO: restart and checkpointing strategies
         // set up checkpointing
-
-        //env.enableCheckpointing(10000L);
-        //env.setRestartStrategy(RestartStrategies.fixedDelayRestart(2, Time.of(10, TimeUnit.SECONDS)));//changed from 60 to 3 for restartAttempts
+        env.enableCheckpointing(3500L, CheckpointingMode.AT_LEAST_ONCE);
+        env.setRestartStrategy(RestartStrategies.fixedDelayRestart(2, Time.of(20, TimeUnit.SECONDS)));//changed from 60 to 3 for restartAttempts
+        env.getCheckpointConfig().setMinPauseBetweenCheckpoints(100);
+        //Flink offers optional compression (default: off) for all checkpoints and savepoints.
+        env.getConfig().setUseSnapshotCompression(true);
         /*env.setRestartStrategy(RestartStrategies.failureRateRestart(10, Time.minutes(1), Time.milliseconds(100)));
         env.enableCheckpointing(100);*/
         //env.enableCheckpointing(10000L, CheckpointingMode.AT_LEAST_ONCE);
@@ -361,7 +363,8 @@ public class MapTwoStreamsDemo1 {
                                 final String uuid, final long deadlineDuration) {
             this.options = options;
             this.outputPath = outputPath;
-            this.uuid = uuid;
+            //this.uuid = uuid;
+            this.uuid = UUID.randomUUID().toString();
             this.fileName = this.outputPath + "/InputMetadata-" + this.uuid;// + ".csv";//TODO: do we need to add thread info to this ?
             this.shutdownWaitTS = shutdownWaitTS;
             this.nThreads = nThreads;
@@ -378,6 +381,7 @@ public class MapTwoStreamsDemo1 {
             logger.debug("SampleSinkAsyncFunction - inputMetaIdx:{}", inputMetaIdx);
             this.fileName = fileName + "-" + inputMetaIdx + ".csv";
             logger.debug("SampleSinkAsyncFunction - fileName after inputMetaIdx: {}", fileName);
+            createDir(outputPath);
             csvMapWriter = new CsvMapWriter(new FileWriter(fileName),
                     CsvPreference.STANDARD_PREFERENCE);
             String[] header = {"ts", "cube", "cameraLst", "timingMap"};
@@ -401,6 +405,13 @@ public class MapTwoStreamsDemo1 {
                     nativeLoaderRead = NativeLoader.getInstance(host, port);
                 }
                 ++counter1;
+            }
+        }
+
+        void createDir(String outputPath) {
+            File directory = new File(outputPath);
+            if (!directory.exists()){
+                directory.mkdirs();
             }
         }
 
@@ -640,7 +651,7 @@ public class MapTwoStreamsDemo1 {
         SyncLatchFunction(final String outputFile, final String outputPath, final String uuid) {
             this.outputFile = outputFile;
             this.outputPath = outputPath;
-            this.uuid = uuid;
+            this.uuid = UUID.randomUUID().toString();
             fileName = outputPath + "/Camera-" + this.uuid + ".csv";
         }
 
@@ -671,6 +682,10 @@ public class MapTwoStreamsDemo1 {
                     .getMetricGroup()
                     .addGroup("MyMetrics")
                     .meter("syncLatchMeter", new DropwizardMeterWrapper(new com.codahale.metrics.Meter()));
+            File directory = new File(outputPath);
+            if (!directory.exists()){
+                directory.mkdirs();
+            }
             csvCameraMapWriter = new CsvMapWriter(new FileWriter(fileName),
                     CsvPreference.STANDARD_PREFERENCE);
             String[] header = {"ts", "cam", "timingMap"};
