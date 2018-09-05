@@ -67,6 +67,8 @@ public class MapTwoStreamsDemo1 {
     private static final String ALL = "all";
     private static final String COPY = "copy";
     private static final String READ = "read";
+    private static final String ERROR = "ERROR";
+    private static final String OK = "OK:";
 
     public static void main(String[] args) throws Exception {
         ParameterTool params = ParameterTool.fromArgs(args);
@@ -313,18 +315,25 @@ public class MapTwoStreamsDemo1 {
                         cameraWithCubeTimingMap.put("AfterCopyImage", -1L);
                     } else {
                         String checkStrValue = nativeLoader.copyImage(deadlineDuration, inputFile, outputFile1, options);
+                        logger.debug("readImage response checkStrValue:{}", checkStrValue);
                         //ERROR:FILE_OPEN:Could not open file for reading
                         //OK:1204835 bytes
-                        if (checkStrValue != null && checkStrValue.startsWith("ERROR")) {
-                            logger.error("Error copyImage:%s for CameraWithCube:%s", checkStrValue, cameraWithCube);
-                            cameraWithCube.getTimingMap().put("Error", -1L);
+                        if (checkStrValue != null) {
+                            if (checkStrValue.startsWith(ERROR)) {
+                                logger.error("Error copyImage:%s for CameraWithCube:%s", checkStrValue, cameraWithCube);
+                                cameraWithCube.getTimingMap().put("Error", -1L);
+                            } else if (checkStrValue.startsWith(OK)) {
+                                String redisHost = checkStrValue.substring(3);
+                                logger.debug("redisHost:{}", redisHost);
+                                cameraWithCube.fileLocation = redisHost;
+                            }
+                            long afterCopyImageTS = System.currentTimeMillis();
+                            long timeTakenForCopyImage = afterCopyImageTS - beforeCopyImageTS;
+                            this.histogram.update(timeTakenForCopyImage);
+                            cameraWithCubeTimingMap.put("AfterCopyImage", afterCopyImageTS);
+                            logger.info("copyImage checkStrValue: {}", checkStrValue);
+                            logger.debug("SampleCopyAsyncFunction - after JNI copyImage to copy S3 file to EFS with efsLocation:{}", outputFile1);
                         }
-                        long afterCopyImageTS = System.currentTimeMillis();
-                        long timeTakenForCopyImage = afterCopyImageTS - beforeCopyImageTS;
-                        this.histogram.update(timeTakenForCopyImage);
-                        cameraWithCubeTimingMap.put("AfterCopyImage", afterCopyImageTS);
-                        logger.info("copyImage checkStrValue: {}", checkStrValue);
-                        logger.debug("SampleCopyAsyncFunction - after JNI copyImage to copy S3 file to EFS with efsLocation:{}", outputFile1);
                     }
                     //polls Queue of wrapped Promises for Completed
                     //The ResultFuture is completed with the first call of ResultFuture.complete. All subsequent complete calls will be ignored.
@@ -410,7 +419,7 @@ public class MapTwoStreamsDemo1 {
 
         void createDir(String outputPath) {
             File directory = new File(outputPath);
-            if (!directory.exists()){
+            if (!directory.exists()) {
                 directory.mkdirs();
             }
         }
@@ -459,7 +468,9 @@ public class MapTwoStreamsDemo1 {
             logger.debug("Entered SampleSinkAsyncFunction.readImageAsync()");
             return CompletableFuture.supplyAsync(() -> {
                 try {
-                    String camFileLocation = cameraTuple.getCamFileLocation();
+                    //String camFileLocation = cameraTuple.getCamFileLocation();
+                    CameraWithCube cameraWithCube = tuple2.f1;
+                    String camFileLocation = cameraWithCube.fileLocation;
                     logger.info("SampleSinkAsyncFunction - before JNI readImage to retrieve EFS file from camFileLocation: {}", camFileLocation);
                     logger.debug("tuple2.f0:{}, tuple2.f1:{}, options:{}", tuple2.f0, tuple2.f1, options);
                     InputMetadata inputMetadata = tuple2.f0;
@@ -683,7 +694,7 @@ public class MapTwoStreamsDemo1 {
                     .addGroup("MyMetrics")
                     .meter("syncLatchMeter", new DropwizardMeterWrapper(new com.codahale.metrics.Meter()));
             File directory = new File(outputPath);
-            if (!directory.exists()){
+            if (!directory.exists()) {
                 directory.mkdirs();
             }
             csvCameraMapWriter = new CsvMapWriter(new FileWriter(fileName),

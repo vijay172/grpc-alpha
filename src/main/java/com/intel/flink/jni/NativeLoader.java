@@ -49,7 +49,7 @@ public class NativeLoader {
                 .setHeight(height)
                 .build();
         String returnValue = imageRefClient.readImageSync(deadlineDuration, inputFile, roi, options, imageRefClient.getChannel());
-        logger.debug(returnValue);
+        logger.debug("readImage returnValue:{}", returnValue);
         return returnValue;
     }
 
