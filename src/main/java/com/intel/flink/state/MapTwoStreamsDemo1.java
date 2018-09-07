@@ -33,6 +33,7 @@ import com.intel.flink.sources.CheckpointedCameraWithCubeSource;
 import com.intel.flink.sources.CheckpointedInputMetadataSource;
 import com.intel.flink.utils.CameraAssigner;
 import com.intel.flink.utils.InputMetadataAssigner;
+import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.supercsv.cellprocessor.constraint.NotNull;
@@ -94,6 +95,7 @@ public class MapTwoStreamsDemo1 {
         final long deadlineDuration = params.getInt("deadlineDuration", 5000);
         final int sourceDelay = params.getInt("sourceDelay", 15000);
         final String action = params.get("action", ALL);//values are: copy,read,all
+        final Boolean checkpoint = params.getBoolean("checkpoint", true);
 
         logger.info("parallelCam:{}, parallelCube:{}, servingSpeedMs:{}, nbrCameras:{}, maxSeqCnt:{}, nbrCubes:{}, " +
                         "nbrCameraTuples:{}, inputFile:{}, outputFile:{}, options:{}, outputPath:{}, local: {}, " +
@@ -115,16 +117,19 @@ public class MapTwoStreamsDemo1 {
         // register the Google Protobuf serializer with Kryo
         //env.getConfig().registerTypeWithKryoSerializer(MyCustomType.class, ProtobufSerializer.class);
         // set up checkpointing
-        env.enableCheckpointing(3500L, CheckpointingMode.AT_LEAST_ONCE);
-        env.setRestartStrategy(RestartStrategies.fixedDelayRestart(2, Time.of(20, TimeUnit.SECONDS)));//changed from 60 to 3 for restartAttempts
-        env.getCheckpointConfig().setMinPauseBetweenCheckpoints(100);
-        //Flink offers optional compression (default: off) for all checkpoints and savepoints.
-        env.getConfig().setUseSnapshotCompression(true);
+        if (checkpoint) {
+            env.enableCheckpointing(3500L, CheckpointingMode.AT_LEAST_ONCE);
+            env.setRestartStrategy(RestartStrategies.fixedDelayRestart(2, Time.of(20, TimeUnit.SECONDS)));//changed from 60 to 3 for restartAttempts
+            env.getCheckpointConfig().setMinPauseBetweenCheckpoints(100);
+            //Flink offers optional compression (default: off) for all checkpoints and savepoints.
+            env.getConfig().setUseSnapshotCompression(true);
         /*env.setRestartStrategy(RestartStrategies.failureRateRestart(10, Time.minutes(1), Time.milliseconds(100)));
         env.enableCheckpointing(100);*/
-        //env.enableCheckpointing(10000L, CheckpointingMode.AT_LEAST_ONCE);
-        //period of the emitted Latency markers is 5 milliseconds
-        //env.getConfig().setRestartStrategy(RestartStrategies.noRestart());
+            //env.enableCheckpointing(10000L, CheckpointingMode.AT_LEAST_ONCE);
+            //period of the emitted Latency markers is 5 milliseconds
+            //env.getConfig().setRestartStrategy(RestartStrategies.noRestart());
+        }
+
         env.getConfig().setLatencyTrackingInterval(5L);
         env.setBufferTimeout(bufferTimeout);
         long startTime = System.currentTimeMillis();
@@ -310,12 +315,12 @@ public class MapTwoStreamsDemo1 {
                     this.beforeCopyDiffGeneratedHistogram.update(diffOfCopyToGenerated);
                     if (diffOfCopyToGenerated > 500) {
                         //print error msg in log & size of queue? & AfterCopyImage -1 & emit it
-                        logger.error("CopyImage Diff from BeforeCopyImage for GeneratedTS:{} is:{} which is > 500 ms", generatedTS, diffOfCopyToGenerated);
+                        logger.error("CopyImage Diff from BeforeCopyImage for GeneratedTS:{} is:{} which is > 500 ms for outputFile1:{}", generatedTS, diffOfCopyToGenerated, outputFile1);
                         //size of queue?
                         cameraWithCubeTimingMap.put("AfterCopyImage", -1L);
                     } else {
                         String checkStrValue = nativeLoader.copyImage(deadlineDuration, inputFile, outputFile1, options);
-                        logger.debug("readImage response checkStrValue:{}", checkStrValue);
+                        logger.debug("copyImage response checkStrValue:{}", checkStrValue);
                         //ERROR:FILE_OPEN:Could not open file for reading
                         //OK:1204835 bytes
                         if (checkStrValue != null) {
@@ -491,14 +496,19 @@ public class MapTwoStreamsDemo1 {
                         //TODO: size of queue?
                         //inputMetadataTimingMap.put("AfterReadImage", -1L);
                     } else {
-                        String checkStrValue = nativeLoaderRead.readImage(deadlineDuration, camFileLocation, 0, 0, 10, 5, options);
-                        if (checkStrValue != null && checkStrValue.startsWith("ERROR")) {
-                            logger.error("Error readImage:%s for InputMetadata:%s", checkStrValue, tuple2.f0);
+                        if (StringUtils.isEmpty(camFileLocation)) {
+                            logger.error("Empty camFileLocation:%s", camFileLocation);
                             inputMetadataTimingMap.put("Error", -1L);
+                        } else {
+                            String checkStrValue = nativeLoaderRead.readImage(deadlineDuration, camFileLocation, 0, 0, 10, 5, options);
+                            if (checkStrValue != null && checkStrValue.startsWith("ERROR")) {
+                                logger.error("Error readImage:%s for InputMetadata:%s", checkStrValue, tuple2.f0);
+                                inputMetadataTimingMap.put("Error", -1L);
+                            }
+                            //inputMetadataTimingMap.put("AfterReadImage", System.currentTimeMillis());
+                            //writeInputMetadataCsv(tuple2);
+                            logger.info("readImage checkStrValue: {}", checkStrValue);
                         }
-                        //inputMetadataTimingMap.put("AfterReadImage", System.currentTimeMillis());
-                        //writeInputMetadataCsv(tuple2);
-                        logger.info("readImage checkStrValue: {}", checkStrValue);
                         logger.debug("SampleSinkAsyncFunction - after JNI readImage to retrieve EFS file from camFileLocation: {}", camFileLocation);
                     }
                     //The ResultFuture is completed with the first call of ResultFuture.complete. All subsequent complete calls will be ignored.
